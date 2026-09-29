@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: code-review-agent
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
+      - key: GITHUB_REPO_OWNER
+        sync: false
+      - key: GITHUB_REPO_NAME
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_WEBHOOK_SECRET
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: HINDSIGHT_BASE_URL
+        sync: false
+      - key: HINDSIGHT_API_KEY
+        sync: false
+      - key: HINDSIGHT_BANK_ID
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: DASHBOARD_TOKEN
+        sync: false

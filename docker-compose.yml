@@ -1,0 +1,32 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Optional: self-hosted Hindsight instead of Hindsight Cloud.
+  # If you use this, set HINDSIGHT_BASE_URL=http://hindsight:8888 in .env
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:latest
+    ports:
+      - "8888:8888"
+    volumes:
+      - hindsight-data:/home/hindsight/.pg0
+    environment:
+      - HINDSIGHT_API_LLM_API_KEY=${GROQ_API_KEY}
+    restart: unless-stopped
+    profiles:
+      - local-hindsight
+
+volumes:
+  hindsight-data:

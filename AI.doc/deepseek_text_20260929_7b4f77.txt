@@ -1,0 +1,33 @@
+You are building a production-quality hackathon project called "Code Review Agent with Hindsight Memory."
+
+## Context
+- Hackathon: HackwithHyderabad 3.0
+- Required tech: Hindsight (memory system by Vectorize) — memory MUST be central to the value proposition
+- Stack: Node.js, Express, GitHub Webhooks, Hindsight SDK, Groq LLM API
+- Time budget: 5 hours total. Scope tightly. No dashboard. No queue. No GitHub App.
+
+## Goal
+Build a GitHub webhook server that:
+1. Receives GitHub pull_request webhook events at POST /webhook
+2. Verifies the X-Hub-Signature-256 header using GITHUB_WEBHOOK_SECRET
+3. Extracts PR number, repo owner, repo name, and action from the payload
+4. Only processes actions: "opened", "synchronize", "reopened"
+5. Fetches the PR diff from GitHub API
+6. Recalls relevant memories from Hindsight using the diff + PR title as query
+7. Sends diff + recalled memories to Groq LLM with a prompt that instructs it to:
+   - Reference past team decisions when relevant
+   - Flag code that violates known conventions
+   - Cite specific memory sources (e.g., "Based on PR #142 decision")
+   - Be concise (max 200 words)
+8. Posts the review as a comment on the PR via GitHub API
+9. Retains the review outcome as a new memory in Hindsight
+
+## Hindsight SDK Usage
+Use these three operations:
+- `client.retain(bankId, content, { context, metadata })` — store a memory
+- `client.recall(bankId, query, { types, budget })` — retrieve relevant memories
+- `client.reflect(bankId, query, { context })` — generate a response grounded in memories
+
+Use bankId = process.env.HINDSIGHT_BANK_ID
+
+## File Structure

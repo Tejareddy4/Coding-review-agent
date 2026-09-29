@@ -1,0 +1,715 @@
+# PROJECT: Code Review Agent with Hindsight Memory
+# HACKATHON: HackwithHyderabad 3.0
+# STACK: Node.js 20, Express, Hindsight, Groq, Docker
+# TIME BUDGET: 5 hours
+
+You are a senior full-stack engineer. Build a production-grade hackathon project called "Code Review Agent with Hindsight Memory". Generate EVERY file listed below with complete, working code. Do not summarize. Do not skip files. Do not use placeholders like "// TODO".
+
+## CORE GOAL
+A GitHub webhook server that:
+1. Receives `pull_request` events at POST /webhook
+2. Verifies X-Hub-Signature-256 using RAW body
+3. Fetches PR diff from GitHub API
+4. Recalls relevant team decisions from Hindsight memory
+5. Generates a review with Groq LLM, injecting recalled memories
+6. Posts the review as a PR comment
+7. Retains new learnings back into Hindsight
+
+## ENGINEERING PRINCIPLES (MUST FOLLOW)
+- Separation of concerns: one module = one responsibility
+- Configuration via environment variables only
+- Structured logging with pino, prefixes [WEBHOOK] [GITHUB] [HINDSIGHT] [GROQ] [REVIEW] [MEMORY]
+- Graceful error handling: never crash on bad payloads
+- Raw body preservation for webhook signature verification
+- Docker-first: multi-stage build, non-root user, health check
+- ES modules (type: module)
+- JSDoc comments on every exported function
+- Idempotent webhook processing (dedupe by X-GitHub-Delivery)
+
+## FILE STRUCTURE
+code-review-agent/
+├── .env.example
+├── .dockerignore
+├── .gitignore
+├── Dockerfile
+├── docker-compose.yml
+├── package.json
+├── README.md
+├── src/
+│   ├── index.js
+│   ├── config.js
+│   ├── logger.js
+│   ├── github.js
+│   ├── hindsight.js
+│   ├── groq.js
+│   ├── review.js
+│   ├── memory.js
+│   └── prompts.js
+├── scripts/
+│   ├── seed-memories.js
+│   └── test-webhook.js
+└── docs/
+    └── DEMO_SCRIPT.md
+
+## FILE CONTENTS
+
+### package.json
+{
+  "name": "code-review-agent",
+  "version": "1.0.0",
+  "description": "AI code review agent with Hindsight persistent memory",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "seed": "node scripts/seed-memories.js",
+    "test-webhook": "node scripts/test-webhook.js"
+  },
+  "dependencies": {
+    "@vectorize-io/hindsight-client": "^0.9.2",
+    "axios": "^1.7.0",
+    "dotenv": "^16.4.0",
+    "express": "^4.21.0",
+    "groq-sdk": "^0.9.0",
+    "pino": "^9.0.0",
+    "pino-pretty": "^13.0.0"
+  },
+  "engines": { "node": ">=20.0.0" }
+}
+
+### .env.example
+GITHUB_TOKEN=ghp_xxxxxxxxxxxx
+GITHUB_WEBHOOK_SECRET=generate-a-random-32-char-string
+GITHUB_REPO_OWNER=your-username
+GITHUB_REPO_NAME=code-review-agent
+HINDSIGHT_BASE_URL=https://api.hindsight.vectorize.io
+HINDSIGHT_API_KEY=hsk_xxxxxxxxxxxx
+HINDSIGHT_BANK_ID=code-review-agent-bank
+GROQ_API_KEY=gsk_xxxxxxxxxxxx
+GROQ_MODEL=openai/gpt-oss-120b
+PORT=8080
+LOG_LEVEL=info
+NODE_ENV=development
+
+### .gitignore
+node_modules/
+.env
+*.log
+logs/
+.DS_Store
+coverage/
+
+### .dockerignore
+node_modules
+.env
+.git
+*.log
+docs
+scripts/test-webhook.js
+
+### Dockerfile
+# ---- Build stage ----
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+
+# ---- Production stage ----
+FROM node:20-alpine AS production
+RUN addgroup -g 1001 -S nodeapp && adduser -S nodeapp -u 1001
+WORKDIR /app
+COPY --from=builder /app/node_modules ./node_modules
+COPY package*.json ./
+COPY src ./src
+COPY scripts ./scripts
+RUN chown -R nodeapp:nodeapp /app
+USER nodeapp
+ENV NODE_ENV=production
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+CMD ["node", "src/index.js"]
+
+### docker-compose.yml
+version: "3.9"
+
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - HINDSIGHT_BASE_URL=${HINDSIGHT_BASE_URL:-http://hindsight:8888}
+    depends_on:
+      hindsight:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:latest
+    ports:
+      - "8888:8888"
+    volumes:
+      - hindsight-data:/home/hindsight/.pg0
+    environment:
+      - HINDSIGHT_API_LLM_API_KEY=${GROQ_API_KEY}
+    restart: unless-stopped
+
+volumes:
+  hindsight-data:
+
+### src/config.js
+import dotenv from 'dotenv';
+dotenv.config();
+
+/**
+ * Read required environment variable; throw if missing.
+ * @param {string} key
+ * @returns {string}
+ */
+const required = (key) => {
+  const val = process.env[key];
+  if (!val) throw new Error(`Missing required env var: ${key}`);
+  return val;
+};
+
+/**
+ * Centralized application configuration.
+ */
+export const config = {
+  port: parseInt(process.env.PORT || '8080', 10),
+  logLevel: process.env.LOG_LEVEL || 'info',
+  nodeEnv: process.env.NODE_ENV || 'development',
+  github: {
+    token: required('GITHUB_TOKEN'),
+    webhookSecret: required('GITHUB_WEBHOOK_SECRET'),
+    repoOwner: process.env.GITHUB_REPO_OWNER || '',
+    repoName: process.env.GITHUB_REPO_NAME || '',
+  },
+  hindsight: {
+    baseUrl: process.env.HINDSIGHT_BASE_URL || 'http://localhost:8888',
+    apiKey: process.env.HINDSIGHT_API_KEY || '',
+    bankId: process.env.HINDSIGHT_BANK_ID || 'code-review-agent-bank',
+  },
+  groq: {
+    apiKey: required('GROQ_API_KEY'),
+    model: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
+  },
+};
+
+### src/logger.js
+import pino from 'pino';
+import { config } from './config.js';
+
+/**
+ * Structured application logger.
+ */
+export const logger = pino({
+  level: config.logLevel,
+  transport:
+    config.nodeEnv !== 'production'
+      ? { target: 'pino-pretty', options: { colorize: true } }
+      : undefined,
+});
+
+### src/prompts.js
+/**
+ * Build system + user prompts for the code review LLM.
+ * @param {string} diff
+ * @param {Array<{text:string,type:string}>} memories
+ * @param {string} prTitle
+ * @returns {{system:string,user:string}}
+ */
+export function buildReviewPrompt(diff, memories, prTitle) {
+  const memoryBlock = memories.length
+    ? memories.map((m, i) => `${i + 1}. [${m.type}] ${m.text}`).join('\n')
+    : 'No relevant past decisions found.';
+
+  return {
+    system: `You are a senior code reviewer with long-term memory of this team's decisions.
+When reviewing, you MUST:
+- Reference past team decisions when relevant (cite the memory by number).
+- Flag code that violates known conventions.
+- Be concise (max 200 words).
+- Use markdown formatting.`,
+    user: `## PR Title
+${prTitle}
+
+## Relevant Past Team Decisions
+${memoryBlock}
+
+## PR Diff
+\`\`\`diff
+${diff.slice(0, 8000)}
+\`\`\`
+
+Provide your review:`,
+  };
+}
+
+/**
+ * Build prompt for extracting typed memories from a review.
+ * @param {string} reviewText
+ * @param {object} prContext
+ * @returns {{system:string,user:string}}
+ */
+export function buildExtractionPrompt(reviewText, prContext) {
+  return {
+    system: `Extract team decisions/conventions from this review.
+Return a JSON object: { "memories": [ { "type": "decision|convention|incident|security_constraint|failed_approach", "content": "string", "confidence": 0.0-1.0 } ] }
+Only include memories with confidence > 0.7. If none, return { "memories": [] }.`,
+    user: `Review:
+${reviewText}
+
+PR Context: ${JSON.stringify(prContext)}`,
+  };
+}
+
+### src/hindsight.js
+import { HindsightClient } from '@vectorize-io/hindsight-client';
+import { config } from './config.js';
+import { logger } from './logger.js';
+
+const client = new HindsightClient({
+  baseUrl: config.hindsight.baseUrl,
+  ...(config.hindsight.apiKey ? { apiKey: config.hindsight.apiKey } : {}),
+});
+
+const BANK = config.hindsight.bankId;
+
+/**
+ * Store a memory in Hindsight.
+ * @param {string} content
+ * @param {string} context
+ * @param {object} [metadata]
+ */
+export async function retainMemory(content, context, metadata = {}) {
+  logger.info(`[HINDSIGHT] Retain: ${content.slice(0, 60)}...`);
+  try {
+    return await client.retain(BANK, content, { context, metadata, async: false });
+  } catch (err) {
+    logger.error({ err }, '[HINDSIGHT] retain failed');
+    return null;
+  }
+}
+
+/**
+ * Recall memories relevant to a query.
+ * @param {string} query
+ * @param {number} [limit]
+ * @returns {Promise<Array<{text:string,type:string,score:number}>>}
+ */
+export async function recallMemories(query, limit = 5) {
+  logger.info(`[HINDSIGHT] Recall: ${query.slice(0, 60)}...`);
+  try {
+    const response = await client.recall(BANK, query, {
+      budget: 'high',
+      maxTokens: 4096,
+    });
+    const results = response?.results || [];
+    return results.slice(0, limit).map((r) => ({
+      text: r.text,
+      type: r.type || 'observation',
+      score: r.score || 0,
+    }));
+  } catch (err) {
+    logger.error({ err }, '[HINDSIGHT] recall failed');
+    return [];
+  }
+}
+
+/**
+ * Reflect on memories to generate a grounded response.
+ * @param {string} query
+ * @param {string} context
+ * @returns {Promise<string>}
+ */
+export async function reflectOnMemories(query, context) {
+  try {
+    const answer = await client.reflect(BANK, query, { context, budget: 'mid' });
+    return answer?.text || '';
+  } catch (err) {
+    logger.error({ err }, '[HINDSIGHT] reflect failed');
+    return '';
+  }
+}
+
+### src/github.js
+import axios from 'axios';
+import { config } from './config.js';
+import { logger } from './logger.js';
+
+const api = axios.create({
+  baseURL: 'https://api.github.com',
+  headers: {
+    Authorization: `Bearer ${config.github.token}`,
+    Accept: 'application/vnd.github.v3+json',
+    'User-Agent': 'code-review-agent',
+  },
+  timeout: 15000,
+});
+
+/**
+ * Fetch the unified diff for a pull request.
+ * @param {string} owner
+ * @param {string} repo
+ * @param {number} prNumber
+ * @returns {Promise<string>}
+ */
+export async function fetchPRDiff(owner, repo, prNumber) {
+  logger.info(`[GITHUB] Fetch diff: ${owner}/${repo}#${prNumber}`);
+  const { data } = await api.get(`/repos/${owner}/${repo}/pulls/${prNumber}`, {
+    headers: { Accept: 'application/vnd.github.v3.diff' },
+  });
+  return typeof data === 'string' ? data : JSON.stringify(data);
+}
+
+/**
+ * Post a review comment on a pull request.
+ * @param {string} owner
+ * @param {string} repo
+ * @param {number} prNumber
+ * @param {string} body
+ * @returns {Promise<number>} comment id
+ */
+export async function postPRComment(owner, repo, prNumber, body) {
+  logger.info(`[GITHUB] Post comment: ${owner}/${repo}#${prNumber}`);
+  const { data } = await api.post(
+    `/repos/${owner}/${repo}/issues/${prNumber}/comments`,
+    { body }
+  );
+  return data.id;
+}
+
+### src/groq.js
+import Groq from 'groq-sdk';
+import { config } from './config.js';
+import { logger } from './logger.js';
+import { buildReviewPrompt, buildExtractionPrompt } from './prompts.js';
+
+const groq = new Groq({ apiKey: config.groq.apiKey });
+
+/**
+ * Generate a code review using Groq, injecting Hindsight memories.
+ * Retries once on failure.
+ * @param {string} diff
+ * @param {Array<{text:string,type:string}>} memories
+ * @param {string} prTitle
+ * @returns {Promise<string>}
+ */
+export async function generateReview(diff, memories, prTitle) {
+  const prompt = buildReviewPrompt(diff, memories, prTitle);
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const completion = await groq.chat.completions.create({
+        model: config.groq.model,
+        messages: [
+          { role: 'system', content: prompt.system },
+          { role: 'user', content: prompt.user },
+        ],
+        temperature: 0.2,
+        max_tokens: 600,
+      });
+      return completion.choices[0]?.message?.content || 'No review generated.';
+    } catch (err) {
+      logger.warn(`[GROQ] Attempt ${attempt} failed: ${err.message}`);
+      if (attempt === 2) {
+        return '⚠️ Review agent encountered an error. Please review manually.';
+      }
+    }
+  }
+}
+
+/**
+ * Extract typed memories from a review using Groq JSON mode.
+ * @param {string} reviewText
+ * @param {object} prContext
+ * @returns {Promise<Array<{type:string,content:string,confidence:number}>>}
+ */
+export async function extractMemories(reviewText, prContext) {
+  const prompt = buildExtractionPrompt(reviewText, prContext);
+  try {
+    const completion = await groq.chat.completions.create({
+      model: config.groq.model,
+      messages: [
+        { role: 'system', content: prompt.system },
+        { role: 'user', content: prompt.user },
+      ],
+      temperature: 0,
+      response_format: { type: 'json_object' },
+    });
+    const raw = completion.choices[0]?.message?.content || '{}';
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : parsed.memories || [];
+  } catch (err) {
+    logger.warn(`[GROQ] extractMemories failed: ${err.message}`);
+    return [];
+  }
+}
+
+### src/memory.js
+import { extractMemories } from './groq.js';
+import { retainMemory } from './hindsight.js';
+import { logger } from './logger.js';
+
+/**
+ * Extract learnings from a review and retain them in Hindsight.
+ * @param {string} reviewText
+ * @param {{prNumber:number, repo:string}} prContext
+ * @returns {Promise<Array>}
+ */
+export async function processReviewLearnings(reviewText, prContext) {
+  logger.info('[MEMORY] Extracting learnings from review...');
+  const candidates = await extractMemories(reviewText, prContext);
+  const retained = [];
+
+  for (const mem of candidates) {
+    if (mem && mem.confidence > 0.7 && mem.content) {
+      await retainMemory(mem.content, mem.type || 'observation', {
+        source: `PR #${prContext.prNumber}`,
+        repo: prContext.repo,
+        confidence: mem.confidence,
+      });
+      retained.push(mem);
+    }
+  }
+
+  logger.info(`[MEMORY] Retained ${retained.length} memories`);
+  return retained;
+}
+
+### src/review.js
+import { fetchPRDiff, postPRComment } from './github.js';
+import { recallMemories } from './hindsight.js';
+import { generateReview } from './groq.js';
+import { processReviewLearnings } from './memory.js';
+import { logger } from './logger.js';
+
+const PROCESSABLE_ACTIONS = new Set(['opened', 'synchronize', 'reopened']);
+
+// Idempotency: track processed delivery IDs to skip duplicates.
+const processedDeliveries = new Set();
+
+/**
+ * Orchestrate the full review flow for one PR event.
+ * @param {object} payload - GitHub webhook payload
+ * @param {string} [deliveryId] - X-GitHub-Delivery header
+ */
+export async function processPR(payload, deliveryId) {
+  if (deliveryId) {
+    if (processedDeliveries.has(deliveryId)) {
+      logger.info(`[REVIEW] Skipping duplicate delivery: ${deliveryId}`);
+      return;
+    }
+    processedDeliveries.add(deliveryId);
+  }
+
+  const { action, pull_request: pr, repository: repo } = payload;
+
+  if (!PROCESSABLE_ACTIONS.has(action)) {
+    logger.info(`[REVIEW] Skipping action: ${action}`);
+    return;
+  }
+
+  const owner = repo.owner.login;
+  const repoName = repo.name;
+  const prNumber = pr.number;
+  const prTitle = pr.title;
+
+  logger.info(`[REVIEW] Processing ${owner}/${repoName}#${prNumber}`);
+
+  try {
+    const diff = await fetchPRDiff(owner, repoName, prNumber);
+    const memories = await recallMemories(`${prTitle}\n${diff.slice(0, 2000)}`);
+    const review = await generateReview(diff, memories, prTitle);
+
+    const commentBody = [
+      '## 🤖 Code Review Agent (Hindsight Memory)',
+      '',
+      review,
+      '',
+      '---',
+      `*Recalled ${memories.length} relevant team decision(s) from memory.*`,
+    ].join('\n');
+
+    await postPRComment(owner, repoName, prNumber, commentBody);
+    await processReviewLearnings(review, {
+      prNumber,
+      repo: `${owner}/${repoName}`,
+    });
+
+    logger.info(`[REVIEW] Completed for PR #${prNumber}`);
+  } catch (err) {
+    logger.error({ err }, `[REVIEW] Failed for PR #${prNumber}`);
+  }
+}
+
+### src/index.js
+import express from 'express';
+import crypto from 'crypto';
+import { config } from './config.js';
+import { logger } from './logger.js';
+import { processPR } from './review.js';
+
+const app = express();
+
+// Raw body required for webhook signature verification.
+app.use('/webhook', express.raw({ type: 'application/json' }));
+
+app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+
+app.post('/webhook', (req, res) => {
+  const signature = req.headers['x-hub-signature-256'];
+  const deliveryId = req.headers['x-github-delivery'];
+  const event = req.headers['x-github-event'];
+
+  if (!signature) {
+    logger.warn('[WEBHOOK] Missing signature header');
+    return res.status(401).send('Unauthorized');
+  }
+
+  const expected = `sha256=${crypto
+    .createHmac('sha256', config.github.webhookSecret)
+    .update(req.body)
+    .digest('hex')}`;
+
+  const sigBuf = Buffer.from(signature);
+  const expBuf = Buffer.from(expected);
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    logger.warn('[WEBHOOK] Invalid signature');
+    return res.status(401).send('Unauthorized');
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(req.body.toString());
+  } catch (err) {
+    logger.warn({ err }, '[WEBHOOK] Invalid JSON');
+    return res.status(400).send('Bad Request');
+  }
+
+  logger.info(`[WEBHOOK] Received ${event} (delivery ${deliveryId})`);
+  res.status(200).send('OK');
+
+  // Process asynchronously — GitHub expects fast ACK.
+  setImmediate(() => {
+    if (event === 'pull_request') {
+      processPR(payload, deliveryId).catch((err) =>
+        logger.error({ err }, '[WEBHOOK] processPR failed')
+      );
+    }
+  });
+});
+
+app.listen(config.port, () => {
+  logger.info(`[SERVER] Listening on port ${config.port}`);
+});
+
+### scripts/seed-memories.js
+import { retainMemory } from '../src/hindsight.js';
+import { logger } from '../src/logger.js';
+
+const SEED_MEMORIES = [
+  { content: 'Never use `any` type in TypeScript. Use `unknown` with type guards.', type: 'convention' },
+  { content: 'All API endpoints must validate input with Zod.', type: 'convention' },
+  { content: 'Never log PII. Use redactSensitive() before logging.', type: 'security_constraint' },
+  { content: 'React components must have a Storybook story.', type: 'convention' },
+  { content: 'Database queries must use parameterized statements.', type: 'security_constraint' },
+];
+
+async function seed() {
+  for (const mem of SEED_MEMORIES) {
+    await retainMemory(mem.content, mem.type, { source: 'seed' });
+    logger.info(`Seeded: ${mem.content}`);
+  }
+  logger.info('Seeding complete.');
+}
+
+seed().catch((err) => {
+  logger.error({ err }, 'Seed failed');
+  process.exit(1);
+});
+
+### scripts/test-webhook.js
+import axios from 'axios';
+import crypto from 'crypto';
+import { config } from '../src/config.js';
+
+const payload = {
+  action: 'opened',
+  pull_request: {
+    number: 1,
+    title: 'Add user service',
+    body: 'New service for user data',
+  },
+  repository: {
+    name: config.github.repoName || 'test-repo',
+    owner: { login: config.github.repoOwner || 'test-user' },
+  },
+};
+
+const body = JSON.stringify(payload);
+const signature = `sha256=${crypto
+  .createHmac('sha256', config.github.webhookSecret)
+  .update(body)
+  .digest('hex')}`;
+
+axios
+  .post('http://localhost:8080/webhook', body, {
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Hub-Signature-256': signature,
+      'X-GitHub-Event': 'pull_request',
+      'X-GitHub-Delivery': `test-${Date.now()}`,
+    },
+  })
+  .then((res) => console.log('Response:', res.status, res.data))
+  .catch((err) => console.error('Error:', err.message));
+
+### docs/DEMO_SCRIPT.md
+# 60-Second Demo Script
+
+**0:00–0:10 — Problem**
+"Teams forget decisions. The same mistakes repeat in every PR."
+
+**0:10–0:20 — PR #1 (Without Memory)**
+Show PR #1 with `any` type. Agent posts a generic comment: "Consider a more specific type."
+
+**0:20–0:35 — Memory Retained**
+Switch to Hindsight dashboard. Show the new memory: "Never use `any` type. Decision from PR #1."
+
+**0:35–0:50 — PR #2 (With Memory)**
+Show PR #2 with the same mistake. Agent now posts: "Based on our team decision from PR #1, avoid `any`. Use `unknown` with type guards."
+
+**0:50–1:00 — Impact**
+"Same mistake. Two completely different reviews. That's the power of memory."
+
+### README.md
+# Code Review Agent with Hindsight Memory
+
+An AI code review agent that remembers your team's decisions, conventions, and past incidents — and gets smarter with every PR.
+
+## Why Memory Matters
+Without memory, a code reviewer is a generic linter. With Hindsight, it becomes a long-term team contributor that recalls decisions made weeks ago and flags violations with citations.
+
+## Architecture
+```mermaid
+graph TD
+    A[GitHub PR Event] --> B[Webhook /webhook];
+    B --> C{Verify HMAC Signature};
+    C -->|Invalid| D[401 Unauthorized];
+    C -->|Valid| E[Return 200 + Async Process];
+    E --> F[Fetch PR Diff];
+    F --> G[Hindsight: recall memories];
+    G --> H[Groq LLM: generate review];
+    H --> I[Post PR Comment];
+    I --> J[Hindsight: retain new learnings];
