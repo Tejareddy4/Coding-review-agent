@@ -2,6 +2,7 @@ import Groq from 'groq-sdk';
 import { config } from './config.js';
 import { childLogger } from './logger.js';
 import { buildReviewPrompt, buildExtractionPrompt } from './prompts.js';
+import { parseLooseJson, parseStructuredReview } from './findings.js';
 
 const log = childLogger('groq');
 
@@ -102,60 +103,96 @@ async function createWithModelFallback(base, finalPass = false) {
 const FALLBACK_REVIEW =
   '⚠️ Review agent could not generate a review (LLM error). Please review manually.';
 
+/** One review completion; returns trimmed content ('' when empty). */
+async function completeReview(prompt, { jsonMode, maxTokens }) {
+  const { completion, model } = await createWithModelFallback({
+    messages: [
+      { role: 'system', content: prompt.system },
+      { role: 'user', content: prompt.user },
+    ],
+    temperature: 0.2,
+    max_tokens: maxTokens,
+    ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
+  });
+  return { content: completion.choices[0]?.message?.content?.trim() ?? '', model };
+}
+
 /**
  * Generate a code review using Groq, injecting Hindsight memories.
- * Model fallback + rate-limit backoff handled by the chain; returns a
- * safe fallback message on total failure so the PR still gets a response.
+ *
+ * Asks first for a structured JSON review (line-anchored findings). If the
+ * model answers in prose anyway, the prose is used as-is; if it produced
+ * broken JSON (e.g. cut off at the token limit) or rejected JSON mode, one
+ * plain markdown review is requested instead. Model fallback + rate-limit
+ * backoff are handled by the chain; on total failure a safe notice is
+ * returned so the PR still gets a response.
+ * @param {string} diff
+ * @param {Array<{text:string,type:string}>} memories
+ * @param {string} prTitle
+ * @returns {Promise<{text:string, structured:object|null, model:string|null, failed:boolean}>}
+ */
+export async function generateReviewDetailed(diff, memories, prTitle) {
+  const start = Date.now();
+  let model = null;
+  try {
+    let needsProse = false;
+    try {
+      const res = await completeReview(buildReviewPrompt(diff, memories, prTitle), {
+        jsonMode: true,
+        maxTokens: 2000,
+      });
+      model = res.model;
+      const structured = parseStructuredReview(res.content);
+      if (structured) {
+        log.info(
+          { model, findings: structured.findings.length, duration_ms: Date.now() - start },
+          'structured review generated'
+        );
+        return { text: res.content, structured, model, failed: false };
+      }
+      if (res.content && !res.content.startsWith('{')) {
+        log.info({ model, chars: res.content.length }, 'model answered in prose; using it');
+        return { text: res.content, structured: null, model, failed: false };
+      }
+      log.warn({ model }, 'structured review unusable; retrying as prose');
+      needsProse = true;
+    } catch (err) {
+      if (err?.status !== 400) throw err; // only a JSON-mode rejection is worth a prose retry
+      log.warn({ err }, 'JSON mode rejected; retrying as prose');
+      needsProse = true;
+    }
+
+    if (needsProse) {
+      const res = await completeReview(
+        buildReviewPrompt(diff, memories, prTitle, { structured: false }),
+        { jsonMode: false, maxTokens: 900 }
+      );
+      model = res.model;
+      if (res.content) {
+        log.info({ model, chars: res.content.length, duration_ms: Date.now() - start }, 'review generated');
+        return { text: res.content, structured: null, model, failed: false };
+      }
+    }
+    log.warn({ model }, 'empty completion');
+  } catch (err) {
+    log.error(
+      { err, duration_ms: Date.now() - start },
+      'review generation failed; returning fallback notice'
+    );
+  }
+  return { text: FALLBACK_REVIEW, structured: null, model, failed: true };
+}
+
+/**
+ * Generate a code review and return just its text (structured reviews come
+ * back as their raw JSON). Kept for callers that only need a string.
  * @param {string} diff
  * @param {Array<{text:string,type:string}>} memories
  * @param {string} prTitle
  * @returns {Promise<string>}
  */
 export async function generateReview(diff, memories, prTitle) {
-  const prompt = buildReviewPrompt(diff, memories, prTitle);
-  const start = Date.now();
-  try {
-    const { completion, model } = await createWithModelFallback({
-      messages: [
-        { role: 'system', content: prompt.system },
-        { role: 'user', content: prompt.user },
-      ],
-      temperature: 0.2,
-      max_tokens: 700,
-    });
-    const content = completion.choices[0]?.message?.content?.trim();
-    if (content) {
-      log.info(
-        { model, chars: content.length, duration_ms: Date.now() - start },
-        'review generated'
-      );
-      return content;
-    }
-    log.warn({ model }, 'empty completion');
-    return FALLBACK_REVIEW;
-  } catch (err) {
-    log.error(
-      { err, duration_ms: Date.now() - start },
-      'review generation failed; returning fallback notice'
-    );
-    return FALLBACK_REVIEW;
-  }
-}
-
-/**
- * Safely parse a JSON object out of an LLM response string.
- * Tolerates ```json fences and trailing prose.
- * @param {string} raw
- * @returns {object|null}
- */
-function parseLooseJson(raw) {
-  const fenced = raw.match(/\{[\s\S]*\}/); // first {...} block
-  const candidate = fenced ? fenced[0] : raw;
-  try {
-    return JSON.parse(candidate);
-  } catch {
-    return null;
-  }
+  return (await generateReviewDetailed(diff, memories, prTitle)).text;
 }
 
 /**

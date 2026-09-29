@@ -20,6 +20,12 @@ const int = (key, fallback) => {
   return Number.isFinite(n) ? n : fallback;
 };
 
+const bool = (key, fallback) => {
+  const raw = (process.env[key] ?? '').trim().toLowerCase();
+  if (!raw) return fallback;
+  return !['false', '0', 'no', 'off'].includes(raw);
+};
+
 /**
  * Ordered Groq model chain. Free-tier rate limits are enforced PER MODEL
  * (30 RPM / 1K RPD / 8K TPM / 200K TPD each), so on a 429 the client
@@ -69,6 +75,20 @@ export const config = {
   review: {
     maxDiffChars: int('MAX_DIFF_CHARS', 8000),
     memoryConfidenceThreshold: Number(process.env.MEMORY_CONFIDENCE_THRESHOLD || 0.7),
+    // Line-anchored review comments with one-click suggestions.
+    inlineComments: bool('REVIEW_INLINE_COMMENTS', true),
+    // Commit status check ("code-review-agent") on the PR head commit.
+    commitStatus: bool('REVIEW_COMMIT_STATUS', true),
+    // Lowest severity that turns the commit status red.
+    failOn: (process.env.REVIEW_FAIL_ON || 'critical').toLowerCase(),
+  },
+  chatops: {
+    // Slash commands in PR comments (/review, /remember, /ask, /recall, /help).
+    enabled: bool('CHATOPS_ENABLED', true),
+  },
+  dashboard: {
+    // Required in production; without it the dashboard is only served in development.
+    token: process.env.DASHBOARD_TOKEN || '',
   },
   database: {
     // Optional Postgres (e.g. Neon). Enables persistent webhook dedupe,
@@ -91,6 +111,12 @@ export function validateConfig(cfg = config) {
   }
   if (!/^[a-zA-Z0-9._-]+$/.test(cfg.hindsight.bankId)) {
     errors.push('HINDSIGHT_BANK_ID contains invalid characters');
+  }
+  if (!['critical', 'high', 'medium', 'low', 'never'].includes(cfg.review.failOn)) {
+    errors.push('REVIEW_FAIL_ON must be one of critical, high, medium, low, never');
+  }
+  if (cfg.dashboard.token && cfg.dashboard.token.length < 16) {
+    errors.push('DASHBOARD_TOKEN must be at least 16 characters');
   }
   if (cfg.github.apiUrl && !/^https?:\/\//.test(cfg.github.apiUrl)) {
     errors.push('GITHUB_API_URL must start with http:// or https://');

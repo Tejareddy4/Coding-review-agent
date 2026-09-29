@@ -3,6 +3,7 @@ import { retainMemory } from './hindsight.js';
 import { config } from './config.js';
 import { childLogger } from './logger.js';
 import { recordLearning } from './store.js';
+import { recordLearningActivity } from './activity.js';
 
 const log = childLogger('memory');
 
@@ -68,6 +69,14 @@ export async function processReviewLearnings(reviewText, prContext) {
       content,
       confidence: mem.confidence,
       retained: wasRetained,
+    });
+    recordLearningActivity({
+      repo: prContext.repo,
+      prNumber: prContext.prNumber,
+      type,
+      content,
+      retained: wasRetained,
+      source: 'review',
     });
   }
 

@@ -28,7 +28,7 @@ export function startMockServer(routes = []) {
         res.end(JSON.stringify({ message: `no mock route: ${req.method} ${req.url}` }));
         return;
       }
-      route.handler(res, body);
+      route.handler(res, body, req);
     });
   });
 
@@ -51,12 +51,16 @@ export const completion = (content) => ({
   choices: [{ message: { role: 'assistant', content } }],
 });
 
+/** Head commit sha returned by the mock PR metadata endpoint. */
+export const HEAD_SHA = 'a'.repeat(40);
+
 /** Standard mock upstreams for the full pipeline. */
 export async function startMockUpstreams(overrides = {}) {
   // Mutable so tests can change LLM/mock behavior between calls.
   const state = {
     reviewText: overrides.reviewText ?? '## Review\nPer convention [1]: avoid `any`. Use `unknown`.',
     failDiff: false,
+    rejectReview: false,
     // Rate-limit simulation: listed models get one 429 (with retry-after),
     // then behave normally; always429 keeps 429-ing forever.
     rateLimitedModels: [],
@@ -94,9 +98,14 @@ export async function startMockUpstreams(overrides = {}) {
     {
       method: 'GET',
       match: (u) => /\/repos\/([^/]+)\/([^/]+)\/pulls\/\d+$/.test(u),
-      handler: (res) => {
+      handler: (res, _body, req) => {
         if (state.failDiff) {
           return json(res, 500, { message: 'boom' });
+        }
+        if (!String(req.headers.accept).includes('diff')) {
+          // PR metadata (fetchPR)
+          const number = Number(req.url.split('/').pop());
+          return json(res, 200, { number, title: 'Mock PR title', head: { sha: HEAD_SHA } });
         }
         res.writeHead(200, { 'content-type': 'text/plain' });
         res.end(
@@ -122,6 +131,26 @@ export async function startMockUpstreams(overrides = {}) {
         }
         json(res, 201, { id: 42, body: parsed.body });
       },
+    },
+    {
+      method: 'POST',
+      match: (u) => /\/pulls\/\d+\/reviews$/.test(u),
+      handler: (res) => {
+        if (state.rejectReview) {
+          return json(res, 422, { message: 'Pull request review thread line must be part of the diff' });
+        }
+        json(res, 200, { id: 7, html_url: 'https://github.com/test-owner/test-repo/pull/1#pullrequestreview-7' });
+      },
+    },
+    {
+      method: 'POST',
+      match: (u) => /\/statuses\/[0-9a-f]+$/.test(u),
+      handler: (res) => json(res, 201, { id: 1 }),
+    },
+    {
+      method: 'POST',
+      match: (u) => /\/issues\/comments\/\d+\/reactions$/.test(u),
+      handler: (res) => json(res, 201, { id: 1 }),
     },
   ]);
 
