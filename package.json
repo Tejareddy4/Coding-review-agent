@@ -1,0 +1,26 @@
+{
+  "name": "code-review-agent",
+  "version": "1.0.0",
+  "description": "AI code review agent with Hindsight persistent memory",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "seed": "node scripts/seed-memories.js",
+    "test-webhook": "node scripts/test-webhook.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "@vectorize-io/hindsight-client": "^0.10.1",
+    "axios": "^1.7.0",
+    "dotenv": "^16.4.0",
+    "express": "^4.21.2",
+    "groq-sdk": "^1.6.0",
+    "pino": "^9.0.0",
+    "pino-pretty": "^13.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
