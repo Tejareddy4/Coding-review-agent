@@ -1,7 +1,10 @@
 import { extractMemories } from './groq.js';
 import { retainMemory } from './hindsight.js';
 import { config } from './config.js';
-import { logger } from './logger.js';
+import { childLogger } from './logger.js';
+import { recordLearning } from './store.js';
+
+const log = childLogger('memory');
 
 const VALID_TYPES = new Set([
   'decision',
@@ -9,6 +12,7 @@ const VALID_TYPES = new Set([
   'incident',
   'security_constraint',
   'failed_approach',
+  'observation', // default when the extractor omits the type (must be valid)
 ]);
 
 const MAX_MEMORIES_PER_REVIEW = 5;
@@ -40,24 +44,33 @@ function isValidMemory(mem) {
  * @returns {Promise<Array<{type:string,content:string,confidence:number}>>}
  */
 export async function processReviewLearnings(reviewText, prContext) {
-  logger.info('[MEMORY] Extracting learnings from review...');
+  log.info('extracting learnings from review');
   const candidates = await extractMemories(reviewText, prContext);
   const retained = [];
 
   for (const mem of candidates.slice(0, MAX_MEMORIES_PER_REVIEW)) {
     if (!isValidMemory(mem)) continue;
-    const result = await retainMemory(
-      mem.content.trim(),
-      mem.type || 'observation',
-      {
-        source: `PR #${prContext.prNumber}`,
-        repo: prContext.repo,
-        confidence: Number(mem.confidence.toFixed(2)),
-      }
-    );
-    if (result && result.success !== false) retained.push(mem);
+    const content = mem.content.trim();
+    const type = mem.type || 'observation';
+    const result = await retainMemory(content, type, {
+      source: `PR #${prContext.prNumber}`,
+      repo: prContext.repo,
+      confidence: Number(mem.confidence.toFixed(2)),
+    });
+    const wasRetained = !!(result && result.success !== false);
+    if (wasRetained) retained.push(mem);
+    // Local source of truth: every extracted learning is recorded,
+    // including ones Hindsight refused — they can be re-synced later.
+    await recordLearning({
+      repo: prContext.repo,
+      prNumber: prContext.prNumber,
+      type,
+      content,
+      confidence: mem.confidence,
+      retained: wasRetained,
+    });
   }
 
-  logger.info(`[MEMORY] Retained ${retained.length} memories`);
+  log.info({ retained: retained.length, candidates: candidates.length }, 'learnings processed');
   return retained;
 }

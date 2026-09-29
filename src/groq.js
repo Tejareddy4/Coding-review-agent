@@ -1,19 +1,111 @@
 import Groq from 'groq-sdk';
 import { config } from './config.js';
-import { logger } from './logger.js';
+import { childLogger } from './logger.js';
 import { buildReviewPrompt, buildExtractionPrompt } from './prompts.js';
+
+const log = childLogger('groq');
 
 const groq = new Groq({
   apiKey: config.groq.apiKey,
   baseURL: config.groq.baseUrl,
   timeout: 30000,
-  maxRetries: 2,
+  maxRetries: 0, // rate-limit retry/shift/backoff is handled below
 });
+
+// Groq free-tier rate limits are enforced PER MODEL (30 RPM / 1K RPD /
+// 8K TPM / 200K TPD). Strategy on 429:
+//   1. shift immediately to the next model in the chain (independent limits)
+//   2. if the whole chain is cooling down, wait out the server's
+//      Retry-After (bounded to one rate window) and make one final pass
+const MAX_RATE_LIMIT_WAIT_MS = 60_000; // one full rate window (1m for RPM/TPM)
+
+const modelCooldowns = new Map(); // model -> timestamp when usable again
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Test helper: clear per-model rate-limit cooldowns. */
+export function resetRateLimitState() {
+  modelCooldowns.clear();
+}
+
+function isRateLimitError(err) {
+  return err?.status === 429 || /rate.?limit/i.test(String(err?.message ?? ''));
+}
+
+function isShiftableError(err) {
+  const status = err?.status ?? 0;
+  return (
+    isRateLimitError(err) ||
+    status >= 500 ||
+    /model.*(overload|unavailable|deprecat)|service_unavailable/i.test(String(err?.message ?? ''))
+  );
+}
+
+function retryAfterMs(err) {
+  const headers = err?.headers ?? {};
+  const raw =
+    typeof headers.get === 'function' ? headers.get('retry-after') : headers['retry-after'];
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  return MAX_RATE_LIMIT_WAIT_MS; // server didn't say: assume one window
+}
+
+/**
+ * Call chat.completions, walking the model chain on rate limits / model
+ * errors. One bounded wait + one final pass if every model is cooling.
+ * @param {object} base - request payload without `model`
+ * @param {boolean} [finalPass] - internal: retry pass after waiting
+ * @returns {Promise<{completion:object, model:string}>}
+ */
+async function createWithModelFallback(base, finalPass = false) {
+  let lastError = null;
+
+  for (const model of config.groq.models) {
+    if (!finalPass) {
+      const coolingMs = (modelCooldowns.get(model) ?? 0) - Date.now();
+      if (coolingMs > 0) {
+        log.info({ model, cooldown_ms: coolingMs }, 'model in rate-limit cooldown, skipping');
+        continue;
+      }
+    }
+    try {
+      const completion = await groq.chat.completions.create({ ...base, model });
+      if (finalPass) log.info({ model }, 'recovered after rate-limit wait');
+      return { completion, model };
+    } catch (err) {
+      lastError = err;
+      if (isRateLimitError(err)) {
+        const waitMs = Math.min(retryAfterMs(err), MAX_RATE_LIMIT_WAIT_MS);
+        modelCooldowns.set(model, Date.now() + waitMs);
+        log.warn({ model, retry_after_ms: waitMs }, 'rate limited, shifting to next model');
+        continue;
+      }
+      if (isShiftableError(err)) {
+        log.warn({ err, model }, 'model unavailable, shifting to next model');
+        continue;
+      }
+      throw err; // auth/validation bugs: fail fast, no point trying other models
+    }
+  }
+
+  if (finalPass) {
+    throw lastError ?? new Error('all Groq models exhausted');
+  }
+
+  const soonest = Math.min(...config.groq.models.map((m) => modelCooldowns.get(m) ?? 0));
+  const waitMs = Math.min(Math.max(soonest - Date.now(), 0), MAX_RATE_LIMIT_WAIT_MS);
+  log.warn({ wait_ms: waitMs }, 'all models rate limited, waiting for next rate window');
+  await sleep(waitMs);
+  return createWithModelFallback(base, true);
+}
+
+const FALLBACK_REVIEW =
+  '⚠️ Review agent could not generate a review (LLM error). Please review manually.';
 
 /**
  * Generate a code review using Groq, injecting Hindsight memories.
- * One in-process retry; returns a safe fallback message on total failure
- * so the PR still gets a response.
+ * Model fallback + rate-limit backoff handled by the chain; returns a
+ * safe fallback message on total failure so the PR still gets a response.
  * @param {string} diff
  * @param {Array<{text:string,type:string}>} memories
  * @param {string} prTitle
@@ -21,25 +113,33 @@ const groq = new Groq({
  */
 export async function generateReview(diff, memories, prTitle) {
   const prompt = buildReviewPrompt(diff, memories, prTitle);
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const completion = await groq.chat.completions.create({
-        model: config.groq.model,
-        messages: [
-          { role: 'system', content: prompt.system },
-          { role: 'user', content: prompt.user },
-        ],
-        temperature: 0.2,
-        max_tokens: 700,
-      });
-      const content = completion.choices[0]?.message?.content?.trim();
-      if (content) return content;
-      logger.warn('[GROQ] Empty completion on attempt %d', attempt);
-    } catch (err) {
-      logger.warn(`[GROQ] Attempt ${attempt} failed: ${err.message}`);
+  const start = Date.now();
+  try {
+    const { completion, model } = await createWithModelFallback({
+      messages: [
+        { role: 'system', content: prompt.system },
+        { role: 'user', content: prompt.user },
+      ],
+      temperature: 0.2,
+      max_tokens: 700,
+    });
+    const content = completion.choices[0]?.message?.content?.trim();
+    if (content) {
+      log.info(
+        { model, chars: content.length, duration_ms: Date.now() - start },
+        'review generated'
+      );
+      return content;
     }
+    log.warn({ model }, 'empty completion');
+    return FALLBACK_REVIEW;
+  } catch (err) {
+    log.error(
+      { err, duration_ms: Date.now() - start },
+      'review generation failed; returning fallback notice'
+    );
+    return FALLBACK_REVIEW;
   }
-  return '⚠️ Review agent could not generate a review (LLM error). Please review manually.';
 }
 
 /**
@@ -67,8 +167,8 @@ function parseLooseJson(raw) {
  */
 export async function extractMemories(reviewText, prContext) {
   const prompt = buildExtractionPrompt(reviewText, prContext);
+  const start = Date.now();
   const base = {
-    model: config.groq.model,
     messages: [
       { role: 'system', content: prompt.system },
       { role: 'user', content: prompt.user },
@@ -78,19 +178,23 @@ export async function extractMemories(reviewText, prContext) {
 
   for (const withJsonMode of [true, false]) {
     try {
-      const completion = await groq.chat.completions.create({
+      const { completion, model } = await createWithModelFallback({
         ...base,
         ...(withJsonMode ? { response_format: { type: 'json_object' } } : {}),
       });
       const raw = completion.choices[0]?.message?.content || '{}';
       const parsed = parseLooseJson(raw);
       const memories = Array.isArray(parsed) ? parsed : parsed?.memories;
-      if (Array.isArray(memories)) return memories;
-      logger.warn('[GROQ] extractMemories: unparseable response shape');
+      if (Array.isArray(memories)) {
+        log.info(
+          { count: memories.length, jsonMode: withJsonMode, model, duration_ms: Date.now() - start },
+          'memories extracted'
+        );
+        return memories;
+      }
+      log.warn({ jsonMode: withJsonMode }, 'unparseable response shape');
     } catch (err) {
-      logger.warn(
-        `[GROQ] extractMemories (jsonMode=${withJsonMode}) failed: ${err.message}`
-      );
+      log.warn({ err, jsonMode: withJsonMode }, 'memory extraction attempt failed');
     }
   }
   return [];

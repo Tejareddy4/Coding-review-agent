@@ -21,6 +21,24 @@ const int = (key, fallback) => {
 };
 
 /**
+ * Ordered Groq model chain. Free-tier rate limits are enforced PER MODEL
+ * (30 RPM / 1K RPD / 8K TPM / 200K TPD each), so on a 429 the client
+ * shifts to the next model instead of waiting.
+ * GROQ_MODELS (comma-separated) overrides; otherwise GROQ_MODEL pins the
+ * primary and known same-class models serve as failover.
+ */
+function groqModels() {
+  const fromEnv = (process.env.GROQ_MODELS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (fromEnv.length) return fromEnv;
+  const primary = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
+  const fallbacks = ['openai/gpt-oss-20b', 'qwen/qwen3.8-27b'];
+  return [primary, ...fallbacks.filter((m) => m !== primary)];
+}
+
+/**
  * Centralized application configuration. Built once at import time;
  * import-time validation means the process fails fast on bad config.
  */
@@ -43,11 +61,22 @@ export const config = {
   groq: {
     apiKey: required('GROQ_API_KEY', 'key from https://console.groq.com'),
     model: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
-    baseUrl: process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1',
+    // NOTE: groq-sdk appends /openai/v1 itself — do NOT include it here,
+    // or every request 404s with a doubled path (/openai/v1/openai/v1/...).
+    baseUrl: process.env.GROQ_BASE_URL || 'https://api.groq.com',
+    models: groqModels(),
   },
   review: {
     maxDiffChars: int('MAX_DIFF_CHARS', 8000),
     memoryConfidenceThreshold: Number(process.env.MEMORY_CONFIDENCE_THRESHOLD || 0.7),
+  },
+  database: {
+    // Optional Postgres (e.g. Neon). Enables persistent webhook dedupe,
+    // Hindsight recall caching and local review/learning audit storage.
+    url: process.env.DATABASE_URL || '',
+  },
+  store: {
+    recallCacheTtlSec: int('RECALL_CACHE_TTL_SEC', 3600),
   },
 };
 

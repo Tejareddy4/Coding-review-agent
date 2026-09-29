@@ -1,5 +1,7 @@
 import { retainMemory } from '../src/hindsight.js';
-import { logger } from '../src/logger.js';
+import { childLogger } from '../src/logger.js';
+
+const log = childLogger('seed');
 
 const SEED_MEMORIES = [
   { content: 'Never use the `any` type in TypeScript. Use `unknown` with type guards.', type: 'convention' },
@@ -16,17 +18,17 @@ async function seed() {
     const result = await retainMemory(mem.content, mem.type, { source: 'seed' });
     if (result) {
       ok++;
-      logger.info(`Seeded: ${mem.content}`);
+      log.info({ seeded: mem.content }, 'memory seeded');
     }
   }
-  logger.info(`Seeding complete: ${ok}/${SEED_MEMORIES.length} retained.`);
+  log.info({ retained: ok, total: SEED_MEMORIES.length }, 'seeding complete');
   if (ok === 0) {
-    logger.error('No memories retained — check HINDSIGHT_BASE_URL / HINDSIGHT_API_KEY.');
+    log.error('no memories retained — check HINDSIGHT_BASE_URL / HINDSIGHT_API_KEY');
     process.exit(1);
   }
 }
 
 seed().catch((err) => {
-  logger.error({ err: err.message }, 'Seed failed');
+  log.error({ err }, 'seed failed');
   process.exit(1);
 });

@@ -57,6 +57,12 @@ export async function startMockUpstreams(overrides = {}) {
   const state = {
     reviewText: overrides.reviewText ?? '## Review\nPer convention [1]: avoid `any`. Use `unknown`.',
     failDiff: false,
+    // Rate-limit simulation: listed models get one 429 (with retry-after),
+    // then behave normally; always429 keeps 429-ing forever.
+    rateLimitedModels: [],
+    rateLimitRetryAfterSecs: 1,
+    always429: false,
+    rateLimited429s: 0,
     extractedMemories:
       overrides.extractedMemories ??
       [
@@ -125,6 +131,22 @@ export async function startMockUpstreams(overrides = {}) {
       match: (u) => u.endsWith('/chat/completions'),
       handler: (res, body) => {
         const parsed = JSON.parse(body);
+        const model = parsed.model;
+        if (state.always429 || state.rateLimitedModels.includes(model)) {
+          if (!state.always429) {
+            state.rateLimitedModels = state.rateLimitedModels.filter((m) => m !== model);
+          }
+          state.rateLimited429s++;
+          res.writeHead(429, {
+            'content-type': 'application/json',
+            'retry-after': String(state.rateLimitRetryAfterSecs ?? 1),
+          });
+          return res.end(
+            JSON.stringify({
+              error: { message: `Rate limit reached for model ${model}`, type: 'rate_limit_exceeded' },
+            })
+          );
+        }
         const system = parsed.messages?.[0]?.content || '';
         if (system.includes('Extract durable team decisions')) {
           return json(
@@ -166,7 +188,7 @@ export async function startMockUpstreams(overrides = {}) {
 }
 
 /** Set env to point all upstreams at the mocks; must run BEFORE src imports. */
-export function configureTestEnv(upstreams) {
+export function configureTestEnv(upstreams, extra = {}) {
   process.env = {
     ...process.env,
     GITHUB_TOKEN: 'ghp_test-token',
@@ -183,6 +205,8 @@ export function configureTestEnv(upstreams) {
     NODE_ENV: 'production', // disables pino-pretty transport worker in tests
     LOG_LEVEL: 'silent',
     PORT: '0',
+    DATABASE_URL: '', // never touch a real DB from the test suite
+    ...extra,
   };
 }
 

@@ -3,9 +3,25 @@ import { recallMemories } from './hindsight.js';
 import { generateReview } from './groq.js';
 import { processReviewLearnings } from './memory.js';
 import { extractChangedFiles, sanitizeDiff } from './prompts.js';
-import { logger } from './logger.js';
+import { config } from './config.js';
+import { childLogger, logContext } from './logger.js';
+import {
+  isStoreEnabled,
+  markDeliveryProcessed,
+  getCachedMemories,
+  putCachedMemories,
+  hashRecallQuery,
+  recordReview,
+} from './store.js';
 
-const PROCESSABLE_ACTIONS = new Set(['opened', 'synchronize', 'reopened']);
+const log = childLogger('review');
+
+const PROCESSABLE_ACTIONS = new Set([
+  'opened',
+  'synchronize',
+  'reopened',
+  'ready_for_review', // draft -> ready: this is the moment a draft becomes reviewable
+]);
 
 // ---------------------------------------------------------------------------
 // Idempotency: bounded TTL cache of processed X-GitHub-Delivery IDs.
@@ -78,22 +94,35 @@ function buildRecallQuery(prTitle, diff) {
  * @param {string} [deliveryId] - X-GitHub-Delivery header value
  */
 export async function processPR(payload, deliveryId) {
-  if (deliveryId && isDuplicateDelivery(deliveryId)) {
-    logger.info(`[REVIEW] Skipping duplicate delivery: ${deliveryId}`);
-    return { status: 'duplicate' };
+  if (deliveryId) {
+    // Persistent claim when the store is enabled; in-memory fallback otherwise.
+    const isNew = isStoreEnabled()
+      ? await markDeliveryProcessed(deliveryId)
+      : !isDuplicateDelivery(deliveryId);
+    if (!isNew) {
+      log.info({ deliveryId }, 'skipping duplicate delivery');
+      return { status: 'duplicate' };
+    }
   }
 
   const shape = validatePRPayload(payload);
   if (!shape.ok) {
-    logger.warn(`[REVIEW] Rejecting malformed payload: ${shape.reason}`);
+    log.warn({ reason: shape.reason }, 'rejecting malformed payload');
     return { status: 'invalid_payload' };
   }
 
   const { action, pull_request: pr, repository: repo } = payload;
 
   if (!PROCESSABLE_ACTIONS.has(action)) {
-    logger.info(`[REVIEW] Skipping action: ${action}`);
+    log.info({ action }, 'skipping action');
     return { status: 'skipped_action' };
+  }
+
+  // Drafts are work-in-progress; review when they are marked ready
+  // (GitHub then sends the ready_for_review action).
+  if (pr.draft === true) {
+    log.info({ action }, 'skipping draft PR until ready_for_review');
+    return { status: 'skipped_draft' };
   }
 
   const owner = repo.owner.login;
@@ -101,36 +130,97 @@ export async function processPR(payload, deliveryId) {
   const prNumber = pr.number;
   const prTitle = pr.title;
 
-  logger.info(`[REVIEW] Processing ${owner}/${repoName}#${prNumber} (action=${action})`);
-
-  try {
-    const diff = await fetchPRDiff(owner, repoName, prNumber);
-    if (!diff.trim()) {
-      logger.info(`[REVIEW] No diff content for PR #${prNumber}; nothing to review`);
-      return { status: 'empty_diff' };
-    }
-
-    const memories = await recallMemories(buildRecallQuery(prTitle, diff));
-    logger.info(`[REVIEW] Recalled ${memories.length} memories for PR #${prNumber}`);
-
-    const review = await generateReview(diff, memories, prTitle);
-
-    const commentBody = [
-      '## 🤖 Code Review Agent (Hindsight Memory)',
-      '',
-      review,
-      '',
-      '---',
-      `*Recalled ${memories.length} relevant team decision(s) from long-term memory.*`,
-    ].join('\n');
-
-    await postPRComment(owner, repoName, prNumber, commentBody);
-    await processReviewLearnings(review, { prNumber, repo: `${owner}/${repoName}` });
-
-    logger.info(`[REVIEW] Completed for PR #${prNumber}`);
-    return { status: 'completed', memories: memories.length };
-  } catch (err) {
-    logger.error({ err: err.message }, `[REVIEW] Failed for PR #${prNumber}`);
-    return { status: 'error', error: err.message };
+  // Repo allowlist: when both GITHUB_REPO_OWNER and GITHUB_REPO_NAME are set,
+  // refuse anything else — an org-wide webhook must not make the agent review
+  // (and comment in) repositories the operator never opted into.
+  if (
+    config.github.repoOwner &&
+    config.github.repoName &&
+    (owner !== config.github.repoOwner || repoName !== config.github.repoName)
+  ) {
+    log.warn(
+      { repo: `${owner}/${repoName}`, allowlisted: `${config.github.repoOwner}/${config.github.repoName}` },
+      'repository not in allowlist, skipping'
+    );
+    return { status: 'foreign_repo' };
   }
+
+  const startedAt = Date.now();
+
+  // Everything below runs with this PR attached to every log line.
+  return logContext.run(
+    { ...logContext.getStore(), pr: `${owner}/${repoName}#${prNumber}` },
+    async () => {
+      log.info({ action }, 'processing pull request');
+      try {
+        const diff = await fetchPRDiff(owner, repoName, prNumber);
+        if (!diff.trim()) {
+          log.info('no diff content; nothing to review');
+          return { status: 'empty_diff' };
+        }
+
+        const recallStart = Date.now();
+        const recallQuery = buildRecallQuery(prTitle, diff);
+        const cacheKey = hashRecallQuery(recallQuery);
+        let memories = await getCachedMemories(cacheKey);
+        if (memories) {
+          log.info({ memories: memories.length, cached: true }, 'memories recalled from cache');
+        } else {
+          memories = await recallMemories(recallQuery);
+          await putCachedMemories(cacheKey, memories);
+          log.info(
+            { memories: memories.length, duration_ms: Date.now() - recallStart },
+            'memories recalled'
+          );
+        }
+
+        const reviewStart = Date.now();
+        const review = await generateReview(diff, memories, prTitle);
+        log.info({ duration_ms: Date.now() - reviewStart }, 'review generated');
+
+        const commentBody = [
+          '## 🤖 Code Review Agent (Hindsight Memory)',
+          '',
+          review,
+          '',
+          '---',
+          `*Recalled ${memories.length} relevant team decision(s) from long-term memory.*`,
+        ].join('\n');
+
+        await postPRComment(owner, repoName, prNumber, commentBody);
+        await processReviewLearnings(review, { prNumber, repo: `${owner}/${repoName}` });
+
+        await recordReview({
+          deliveryId,
+          repo: `${owner}/${repoName}`,
+          prNumber,
+          status: 'completed',
+          memoriesUsed: memories.length,
+          durationMs: Date.now() - startedAt,
+          reviewText: review,
+        });
+
+        log.info(
+          {
+            status: 'completed',
+            memories: memories.length,
+            duration_ms: Date.now() - startedAt,
+          },
+          'review completed'
+        );
+        return { status: 'completed', memories: memories.length };
+      } catch (err) {
+        log.error({ err, duration_ms: Date.now() - startedAt }, 'review failed');
+        await recordReview({
+          deliveryId,
+          repo: `${owner}/${repoName}`,
+          prNumber,
+          status: 'error',
+          error: err.message,
+          durationMs: Date.now() - startedAt,
+        });
+        return { status: 'error', error: err.message };
+      }
+    }
+  );
 }
