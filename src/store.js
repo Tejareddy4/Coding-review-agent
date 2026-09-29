@@ -81,6 +81,16 @@ async function runMigrations() {
     retained_in_hindsight BOOLEAN NOT NULL DEFAULT false,
     created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
   )`);
+  // Structured-review columns (added after the first release; idempotent).
+  await pool.query(`ALTER TABLE reviews
+    ADD COLUMN IF NOT EXISTS pr_title        TEXT,
+    ADD COLUMN IF NOT EXISTS verdict         TEXT,
+    ADD COLUMN IF NOT EXISTS risk            INTEGER,
+    ADD COLUMN IF NOT EXISTS findings        JSONB,
+    ADD COLUMN IF NOT EXISTS memories_cited  INTEGER,
+    ADD COLUMN IF NOT EXISTS inline_comments INTEGER,
+    ADD COLUMN IF NOT EXISTS review_url      TEXT,
+    ADD COLUMN IF NOT EXISTS review_trigger  TEXT`);
 }
 
 /** Connect + migrate, with bounded retries (cold connections can be flaky). */
@@ -214,8 +224,9 @@ export async function recordReview(entry) {
   try {
     await pool.query(
       `INSERT INTO reviews
-         (delivery_id, repo, pr_number, status, model, memories_used, duration_ms, review_text, error)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+         (delivery_id, repo, pr_number, status, model, memories_used, duration_ms, review_text, error,
+          pr_title, verdict, risk, findings, memories_cited, inline_comments, review_url, review_trigger)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16,$17)`,
       [
         entry.deliveryId ?? null,
         entry.repo,
@@ -226,6 +237,14 @@ export async function recordReview(entry) {
         entry.durationMs ?? null,
         entry.reviewText ?? null,
         entry.error ?? null,
+        entry.prTitle ?? null,
+        entry.verdict ?? null,
+        entry.risk ?? null,
+        entry.counts ? JSON.stringify(entry.counts) : null,
+        entry.memoriesCited ?? null,
+        entry.inlineComments ?? null,
+        entry.url ?? null,
+        entry.trigger ?? null,
       ]
     );
   } catch (err) {
@@ -253,6 +272,74 @@ export async function recordLearning(entry) {
   } catch (err) {
     log.error({ err: err.message }, 'learning write failed');
     maybeReconnect(err);
+  }
+}
+
+/**
+ * Drop every cached recall result. Called when the team explicitly teaches
+ * a new memory, so the very next review is guaranteed to see it.
+ */
+export async function clearMemoryCache() {
+  if (!pool) return;
+  try {
+    await pool.query('DELETE FROM memory_cache');
+  } catch (err) {
+    log.error({ err: err.message }, 'cache clear failed');
+    maybeReconnect(err);
+  }
+}
+
+/**
+ * Recent reviews + learnings in the activity-feed shape (dashboard hydration).
+ * @returns {Promise<{reviews:Array<object>, learnings:Array<object>}>}
+ */
+export async function loadRecentActivity(limit = 50) {
+  if (!pool) return { reviews: [], learnings: [] };
+  try {
+    const [reviews, learnings] = await Promise.all([
+      pool.query(
+        `SELECT created_at, repo, pr_number, pr_title, status, verdict, risk, findings, model,
+                memories_used, memories_cited, inline_comments, duration_ms, review_url, review_trigger
+           FROM reviews ORDER BY created_at DESC LIMIT $1`,
+        [limit]
+      ),
+      pool.query(
+        `SELECT created_at, repo, pr_number, type, content, retained_in_hindsight
+           FROM learnings ORDER BY created_at DESC LIMIT $1`,
+        [limit]
+      ),
+    ]);
+    return {
+      reviews: reviews.rows.map((r) => ({
+        at: new Date(r.created_at).toISOString(),
+        repo: r.repo,
+        prNumber: r.pr_number,
+        prTitle: r.pr_title,
+        status: r.status,
+        verdict: r.verdict,
+        risk: r.risk,
+        counts: r.findings,
+        model: r.model,
+        memoriesUsed: r.memories_used ?? 0,
+        memoriesCited: r.memories_cited ?? 0,
+        inlineComments: r.inline_comments ?? 0,
+        durationMs: r.duration_ms,
+        url: r.review_url,
+        trigger: r.review_trigger,
+      })),
+      learnings: learnings.rows.map((l) => ({
+        at: new Date(l.created_at).toISOString(),
+        repo: l.repo,
+        prNumber: l.pr_number,
+        type: l.type,
+        content: l.content,
+        retained: l.retained_in_hindsight,
+        source: 'review',
+      })),
+    };
+  } catch (err) {
+    log.error({ err: err.message }, 'activity load failed');
+    return { reviews: [], learnings: [] };
   }
 }
 

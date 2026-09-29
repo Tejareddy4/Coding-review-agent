@@ -3,8 +3,11 @@ import crypto from 'crypto';
 import { pathToFileURL } from 'node:url';
 import { config } from './config.js';
 import { logContext, childLogger } from './logger.js';
-import { initStore, closeStore } from './store.js';
+import { initStore, closeStore, loadRecentActivity, isStoreEnabled } from './store.js';
 import { processPR } from './review.js';
+import { processComment } from './commands.js';
+import { dashboardRouter } from './dashboard.js';
+import { hydrateActivity } from './activity.js';
 
 const httpLog = childLogger('http');
 const webhookLog = childLogger('webhook');
@@ -47,7 +50,7 @@ export function buildApp() {
       httpLog.info(
         {
           method: req.method,
-          path: req.url,
+          path: req.path, // never req.url: query strings may carry the dashboard token
           status: res.statusCode,
           duration_ms: Date.now() - start,
         },
@@ -60,6 +63,8 @@ export function buildApp() {
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok', uptime: process.uptime() });
   });
+
+  app.use(dashboardRouter());
 
   app.post('/webhook', (req, res) => {
     const headers = {
@@ -111,6 +116,11 @@ function handleWebhook(req, res, { signature, deliveryId, event }) {
       processPR(payload, deliveryId).catch((err) =>
         webhookLog.error({ err }, 'processPR failed')
       );
+    } else if (event === 'issue_comment') {
+      // ChatOps: /review, /remember, /ask, /recall, /help in PR comments
+      processComment(payload, deliveryId).catch((err) =>
+        webhookLog.error({ err }, 'processComment failed')
+      );
     }
   });
 }
@@ -120,6 +130,7 @@ const isMain =
   process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
   await initStore();
+  if (isStoreEnabled()) hydrateActivity(await loadRecentActivity());
   const app = buildApp();
   const server = app.listen(config.port, () => {
     serverLog.info(`listening on port ${config.port} (${config.nodeEnv})`);
