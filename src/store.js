@@ -22,7 +22,12 @@ const CONNECTION_ERROR = /terminated|timeout|ECONN|ETIMEDOUT|fetch failed|networ
  */
 async function createPool() {
   if (/neon\.tech/i.test(config.database.url)) {
-    const { Pool: NeonPool } = await import('@neondatabase/serverless');
+    const { Pool: NeonPool, neonConfig } = await import('@neondatabase/serverless');
+    // Node has no global WebSocket (unlike edge/browser runtimes the driver
+    // targets by default); without this the Pool's WS handshake fails with
+    // "fetch failed" and never reaches the actual connection error.
+    const { default: ws } = await import('ws');
+    neonConfig.webSocketConstructor = ws;
     return new NeonPool({ connectionString: config.database.url });
   }
   const options = {
